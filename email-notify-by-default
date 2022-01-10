@@ -1,0 +1,136 @@
+#!/usr/bin/perl -w
+# vim: set noexpandtab:
+
+# For all users, turn on unset email notifications.
+#
+# This is a one-time correction to phpBB's lame new user notification defaults.
+# Fortunately, email entries with notify=0 in the phpbb_user_notifications
+# table only appear by user action, so it's easy to avoid overwriting explicit
+# user choices.
+#
+# Going forward, our updates to the david63/userdefaults extension allow us to
+# default all 13 email notifications to ON for new users:
+#
+# https://github.com/apoe4info/userdefaults
+#
+# This was tested against phpBB v3.3.5.
+
+use strict;
+
+use DBI;
+my $db = 'apoeinfo_bb1';
+#my $db = 'apoeinfo_bbdev1';
+
+# dbi.conf should contain .ini-style stanzas like this:
+#
+# [thedatabase]
+# type = DBI:mysql
+# host = thehost:theport
+# user = theuser
+# pw = thepassword
+
+use Config::Tiny;
+my $Config = Config::Tiny->read("$ENV{HOME}/.config/dbi.conf");
+my $C = $Config->{$db};
+
+my $dbh = DBI->connect(
+	"$C->{type}:database=$db:host=$C->{host}",$C->{user},$C->{pw},
+	{AutoCommit=>1,RaiseError=>1,PrintError=>0}
+);
+
+# For each listed item_type, we will add an email method entry with notify=1
+# for each user if no entry exists. If you don't want a particular notification
+# to be on by default, delete the corresponding row. 
+
+my @type = qw{
+	moderation_queue
+	notification.type.bookmark
+	notification.type.forum
+	notification.type.group_request
+	notification.type.needs_approval
+	notification.type.pm
+	notification.type.post
+	notification.type.quote
+	notification.type.report
+	notification.type.report_pm
+	notification.type.report_pm_closed
+	notification.type.report_post_closed
+	notification.type.topic
+};
+
+my $method = 'notification.method.email';
+my @notify = (0,1);
+
+# Initialize the counts.
+#
+my %count = ();
+foreach my $type (@type) {
+	$count{$type}{initial}{on} = 0;
+	$count{$type}{initial}{off} = 0;
+	$count{$type}{new} = 0;
+}
+$count{initial}{on} = 0;
+$count{initial}{off} = 0;
+$count{new} = 0;
+
+print "DB is $db\n";
+
+# Summarize current state
+my $sth = $dbh->prepare(qq{
+	select count(*)
+	from phpbb_user_notifications
+	where
+		item_type = ? and
+		method = ? and
+		notify = ?;
+});
+print "Initial notification counts:\n";
+foreach my $type (@type) {
+	foreach my $notify (@notify) {
+		$sth->execute($type,$method,$notify);
+		my $count = $sth->fetchrow_array;
+		$type =~ /([^\.]*)$/; my $t = $1;
+		my $n = $notify == 0 ? 'off' : 'on';
+		print "    $t/$n: $count\n";
+		$count{$type}{initial}{$n} += $count;
+		$count{initial}{$n} += $count;
+	}
+}
+$sth->finish;
+print "Total email on/off: $count{initial}{on}/$count{initial}{off}\n";
+
+my $nrows = $dbh->selectall_arrayref(qq{
+	select item_type,user_id,notify from phpbb_user_notifications
+		where method="$method";
+});
+
+# Fill %n so that $n{user_id}{item_type} stores the notify value.
+my %n = ();
+foreach (@$nrows) {
+	$n{$_->[1]}{$_->[0]} = $_->[2];
+}
+
+my $ins_notification_sth = $dbh->prepare(qq{
+	insert into phpbb_user_notifications (item_type,item_id,user_id,method,notify)
+	values (?,0,?,?,1);
+});
+
+for my $user_id (sort { $a <=> $b } keys %n) {
+	#next unless ($user_id == 124); # Test for a particular user
+	for my $type (@type) {
+		unless (defined $n{$user_id}{$type}) {
+			# Disable updates by commenting out the next line
+			$ins_notification_sth->execute($type,$user_id,$method);
+			$count{$type}{new}++;
+			$count{new}++;
+		}
+	}
+}
+$ins_notification_sth->finish;
+
+print "\nNotification update counts:\n";
+foreach my $type (@type) {
+	$type =~ /([^\.]*)$/; my $t = $1;
+	print "    $t: $count{$type}{new}\n";
+}
+print "Total new email: $count{new}\n";
